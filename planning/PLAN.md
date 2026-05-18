@@ -454,3 +454,74 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Review Notes — Questions, Clarifications & Simplifications
+
+This section captures review feedback on the plan. It is not authoritative; treat each item as something to confirm, push back on, or fold into the spec before downstream agents act on it.
+
+### A. Inconsistencies to resolve
+
+1. **Volume mount: named volume vs. bind mount.** Section 4 says "`db/` at the top level is the runtime volume mount point" (bind mount semantics — host `./db` ↔ container `/app/db`), but Section 11's example uses `-v finally-data:/app/db` (a *named* Docker volume, which is **not** the same as the host `db/` directory and won't expose `finally.db` to the host). Pick one model and use it consistently in the directory structure, the start scripts, and the deployment notes. For a teaching project the bind mount (`-v "$(pwd)/db:/app/db"`) is more useful — students can open the SQLite file directly.
+
+2. **SSE cadence vs. data source cadence.** Section 6 says SSE pushes "at a regular cadence (~500ms)" for *all* tickers, but the simulator updates every 500ms while Massive polls every 15s (free tier). MARKET_DATA_SUMMARY.md confirms the implementation uses "version-based change detection" — i.e. SSE pushes only when a price actually changes. Update Section 6 to match: the SSE loop checks the cache at a short interval and emits only on change. This avoids repeated stale ticks on the Massive path.
+
+3. **`/api/*` vs. `/api/stream/*` wording.** Section 10 says "All API calls go to the same origin (`/api/*`)" — true, but reads as if SSE lives elsewhere. Either drop the parenthetical or include `/api/stream/*` explicitly.
+
+4. **Two `db/` directories with different roles.** `backend/db/` (schema/seed logic — source code) and top-level `db/` (runtime SQLite file) are easy to confuse, especially for agents skimming the layout. Consider renaming the source directory to `backend/app/db/` or `backend/schema/` and reserving the bare name `db/` for the runtime volume.
+
+5. **`docker-compose.yml` purpose unclear.** Section 4 lists it as "Optional convenience wrapper" but Section 11 never references it (the start scripts call `docker run` directly, and tests use `docker-compose.test.yml`). Either spell out what `docker-compose.yml` is for (dev hot-reload? local convenience?) or drop it.
+
+### B. Open questions / clarifications
+
+1. **SSE event payload shape.** Section 6 lists the *fields* (ticker, price, previous price, timestamp, direction) but doesn't fix the JSON shape, event name, or whether events are batched. Pin this down — frontend and backend agents will otherwise pick different shapes.
+
+2. **"Daily change %" source.** Section 10's watchlist row shows a daily change %, but neither the simulator nor the cache stores a previous-day close. Define what "daily" means here: session-start price, last-N-minute change, or genuine prior-close (which Massive can give but the simulator cannot)? Simplest: rename to "session change %" and use the first price seen this session.
+
+3. **Sparkline & main-chart history on reload.** Plan says sparklines accumulate "since page load" — so a page refresh wipes them. Same question applies to the main chart for a selected ticker: is it also SSE-accumulated, or is there a backend endpoint that returns recent price history? If the latter, it's missing from Section 8. Recommendation: accept SSE-only accumulation for both (simpler, matches the stated design) and call it out explicitly to forestall scope creep.
+
+4. **Watchlist ↔ data source coupling.** MARKET_DATA_SUMMARY shows `add_ticker`/`remove_ticker` on the source, but PLAN doesn't say that `POST /api/watchlist` calls these. Should adding a ticker to the watchlist also start streaming prices for it? (Presumably yes.) And what happens if the user/LLM adds a ticker the simulator has no seed price for, or that Massive returns 404 on? Spec the validation path: reject unknown tickers? Pick a synthetic seed? Return an error to the user?
+
+5. **LLM trade-validation feedback loop.** Section 9 says "If a trade fails validation, the error is included in the chat response so the LLM can inform the user." But the LLM has already produced its response by the time the trade runs. Clarify: (a) does the backend call the LLM a second time with the failure context, (b) is the failure simply surfaced as a chat-side annotation alongside the LLM's original message, or (c) does the structured-output flow attempt trades first and *then* generate the user-facing message? Option (b) is the simplest; spell it out.
+
+6. **Chat history window.** "Recent conversation history" is unspecified. Define a concrete bound (e.g. last N=20 messages, or a token budget) so behavior is deterministic and test-able.
+
+7. **Concurrency / write isolation.** Trades, snapshots, and watchlist mutations all write to SQLite while a long-lived SSE loop reads prices and computes derived values. Spell out the concurrency model: single async event loop with `aiosqlite`? Threaded executor? A simple per-request connection with WAL mode? This matters because SQLite under FastAPI is a common foot-gun.
+
+8. **Position lifecycle at zero.** When a sell zeroes out a position, does the row get deleted or kept with `quantity=0`? Affects the positions-table rendering and the heatmap.
+
+9. **Snapshot retention.** A 30-second snapshot cadence is ~2,880 rows/day. Over a multi-week demo this is fine, but if the container is left running for months it grows unboundedly. Either add a retention policy (e.g. downsample beyond 24h) or note explicitly that unbounded growth is acceptable for the demo's lifetime.
+
+10. **Mock LLM behavior.** "Deterministic mock responses" is vague. Define the contract: does it echo back? Return a fixed canned response? Branch on keywords in the user message (e.g. "buy 5 AAPL" → emit that trade) so E2E tests can exercise the trade-execution path?
+
+11. **Tablet breakpoint.** "Functional on tablet" — set an actual breakpoint width so the frontend agent doesn't have to guess.
+
+### C. Opportunities to simplify
+
+2. **Collapse `users_profile` into a singleton row.** With one user, this table is really a key/value config holding `cash_balance`. Either keep the table but skip the `id` column, or fold cash into a tiny `app_state` table. Minor, but it removes a layer of indirection.
+
+3. **Don't store an `actions` blob on chat messages — derive it.** The `actions` JSON column on `chat_messages` duplicates data already captured in `trades` and watchlist mutations. Two simpler options: (a) join trades within a small time window of the chat message, or (b) tag rows in `trades` and watchlist with the originating `chat_message_id`. The latter is cheap and avoids JSON-in-a-column.
+
+4. **Single market-data interval everywhere.** Two cadences (simulator 500ms, Massive 15s) and a third for SSE pushes is the kind of complexity that creates real bugs. With version-based change detection, the SSE loop's poll interval is the only thing the user perceives — set one value (say 250ms) and let producers update the cache at whatever rate suits them.
+
+5. **Cut the optional Terraform/App Runner deploy from the doc.** Section 11's "stretch goal" line will tempt an agent to start it. If it's not in scope, remove the mention; if it is, give it its own section.
+
+6. **One `start.sh` / `stop.sh` instead of mac+windows pairs.** A short Bash script works on macOS, Linux, and Windows-with-Git-Bash/WSL — which is what most students who can install Docker already have. Maintaining four shell scripts (two of them PowerShell) doubles the surface area for a thin docker-run wrapper. If Windows support matters, a single `docker compose up` invocation (with a real `docker-compose.yml`) collapses both platforms into one command.
+
+7. **Section 9 mentions the cerebras-inference skill by name twice.** The skill is an agent-time concern, not part of the runtime contract. Mention it once and link to the skill, or move it to an "Implementation notes for agents" appendix so the spec stays about *what* the system does, not *which agent skill to call*.
+
+### D. Smaller things
+
+- Section 3's ASCII diagram has an unaligned `│` on the "Static file serving" line — purely cosmetic.
+- Section 2 mentions "no confirmation dialog" for manual trades and "no confirmation dialog" for LLM trades; the user trusting their own button click is uncontroversial, but it's worth stating once that *all* trades are instant, then not repeating.
+- Plan never says what happens when `OPENROUTER_API_KEY` is missing and `LLM_MOCK=false`. Recommend: backend logs a warning and treats it as `LLM_MOCK=true`, so the rest of the app keeps working.
+- Plan doesn't mention favicons, page title, or any branding beyond color hex codes. Probably out of scope, but if there's a logo/wordmark the design system expects, name it here.
+
+### E. Things that look right and shouldn't change
+
+- Single container, single port, static Next.js export, SSE over WebSockets — these are good choices for a teaching capstone and the rationale table sells them well.
+- The strategy-pattern split between simulator and Massive (already implemented per `MARKET_DATA_SUMMARY.md`) was the right call.
+- Auto-executing LLM trades without a confirmation dialog is the right demo choice given the fake-money context; the plan defends this well.
+- LLM_MOCK as an env flag for E2E determinism is the cleanest possible approach.
+
